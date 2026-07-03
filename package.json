@@ -1,0 +1,42 @@
+{
+  "name": "@kickythrust/pi-fnox",
+  "version": "0.1.0",
+  "description": "Pi extension that injects fnox vault secrets into process.env and bash, scrubs them from output.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "fnox",
+    "secrets",
+    "env",
+    "vault",
+    "age",
+    "encryption"
+  ],
+  "license": "MIT",
+  "author": "Kicky",
+  "homepage": "https://github.com/Bucurenciu-Cristian/pi-fnox",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Bucurenciu-Cristian/pi-fnox.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Bucurenciu-Cristian/pi-fnox/issues"
+  },
+  "files": [
+    "extensions/",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {}
+}
