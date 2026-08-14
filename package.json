@@ -1,6 +1,6 @@
 {
   "name": "@kickythrust/pi-fnox",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pi extension that injects fnox vault secrets into process.env and bash, scrubs them from output.",
   "keywords": [
     "pi-package",
