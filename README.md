@@ -31,11 +31,11 @@ Enable fnox's own daemon/cache if desired. The extension respects it rather than
 - Bash and `!` output is scrubbed **before** streaming updates, truncation and overflow files, including secrets split across UTF-8 chunks.
 - Text, structured tool output and string-valued metadata are scrubbed without dropping codemode's structured results.
 - Native Pi Bash schemas, rendering, session metadata, timeout and cancellation retained; bounded exports and sanitized failure messages.
-- No Runline-specific behavior, no new tools, no Nu hooks, no runtime dependencies beyond Pi and fnox.
+- No Runline-specific behavior, no new tools, no runtime dependencies beyond Pi and fnox.
 
 ## Boundaries
 
-This is hygiene, not a security sandbox. Secrets intentionally live in Pi's process environment and can be read by in-process tools or inherited by subprocesses. Nu is deliberately **not integrated**: no wrapping, fnox activation, or streaming redaction hook. It remains a raw escape hatch; like other child processes, it may inherit the injected environment. Ordinary final tool results still pass through Pi's general redaction hook.
+This is hygiene, not a security sandbox. Secrets intentionally live in Pi's process environment and can be read by in-process tools or inherited by subprocesses.
 
 Redaction only covers exact known string values—not encodings, partial values, images, arbitrary files written by commands, or another tool's raw streaming updates. Do not print secrets. Very short secrets can make output noisy. Decrypted values are never deliberately written to disk by this extension; this is not a secure-memory guarantee.
 
