@@ -37,7 +37,7 @@ Enable fnox's own daemon/cache if desired. The extension respects it rather than
 
 This is hygiene, not a security sandbox. Secrets intentionally live in Pi's process environment and can be read by in-process tools or inherited by subprocesses.
 
-Redaction only covers exact known string values—not encodings, partial values, images, arbitrary files written by commands, or another tool's raw streaming updates. Do not print secrets. Very short secrets can make output noisy. Decrypted values are never deliberately written to disk by this extension; this is not a secure-memory guarantee.
+Redaction only covers exact known string values—not encodings, partial values, images, arbitrary files written by commands, or another tool's raw streaming updates. Very short secrets can make output noisy. Decrypted values are never deliberately written to disk by this extension; this is not a secure-memory guarantee.
 
 ## Development
 
