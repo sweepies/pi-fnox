@@ -1,228 +1,107 @@
-/**
- * pi-fnox — fnox secrets injected into Pi.
- *
- * - Decrypts fnox vault at startup, injects into `process.env` so runline
- *   plugin env: fallbacks (and anything else reading process.env) work in-process.
- * - Injects same secrets into bash subprocess env (built-in tool + user !).
- * - Scrubs secret values from all tool output.
- * - Adds available secret names to the system prompt.
- * - Provides /fnox-list and /fnox-reload commands.
- *
- * Config:
- *   FNOX_CONFIG  — path to fnox.toml (default: ~/.config/fnox/config.toml)
- *   FNOX_PROFILE — fnox profile to use (default: unset = top-level secrets)
- */
-
-import { spawn } from "node:child_process";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import {
-	createBashTool,
-	createLocalBashOperations,
-} from "@mariozechner/pi-coding-agent";
+  createBashToolDefinition,
+  createLocalBashOperations,
+  type BashOperations,
+  type ExtensionAPI,
+  type ToolResultEventResult,
+} from "@earendil-works/pi-coding-agent";
+import { SecretStore } from "../lib/secrets.ts";
 
-interface SecretEntry {
-	name: string;
-	value: string;
+const BASH_OUTPUT_KEYS = new Set(["output", "truncated", "full_output_path", "exit_code", "wall_time_seconds"]);
+const BASH_DETAIL_KEYS = new Set(["truncation", "fullOutputPath"]);
+const BASH_TRUNCATION_KEYS = new Set([
+  "content", "truncated", "truncatedBy", "totalLines", "totalBytes", "outputLines", "outputBytes",
+  "lastLinePartial", "firstLineExceedsLimit", "maxLines", "maxBytes",
+]);
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object" &&
+  (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+
+export function install(pi: ExtensionAPI, store: SecretStore, local: BashOperations): void {
+  const redactDetails = (details: unknown, bash: boolean): unknown => {
+    const masked = store.redactor.value(details, bash ? BASH_DETAIL_KEYS : undefined);
+    if (!bash || !isRecord(details) || !isRecord(details.truncation) || !isRecord(masked)) return masked;
+    const truncation = store.redactor.value(details.truncation, BASH_TRUNCATION_KEYS);
+    // Keep the SDK enum, not arbitrary string metadata; content and unknown keys still get masked.
+    const limit = details.truncation.truncatedBy;
+    if (limit === "lines" || limit === "bytes" || limit === null) truncation.truncatedBy = limit;
+    return { ...masked, truncation };
+  };
+  const redact = <T extends ToolResultEventResult>(result: T, bash = false): T => ({
+    ...result,
+    content: result.content && store.redactor.content(result.content),
+    details: redactDetails(result.details, bash),
+    structuredContent: store.redactor.value(result.structuredContent, bash ? BASH_OUTPUT_KEYS : undefined),
+  });
+  const operations: BashOperations = {
+    async exec(command, cwd, options) {
+      const stream = store.redactor.stream(options.onData);
+      try {
+        return await local.exec(command, cwd, {
+          ...options,
+          env: { ...(options.env ?? process.env), ...store.environment() },
+          onData: data => stream.write(data),
+        });
+      } catch (error) {
+        throw new Error(store.redactor.text(error instanceof Error ? error.message : "Bash execution failed."));
+      } finally {
+        // Flush even on cancellation/timeout; only scrubbed bytes reach Pi's accumulator.
+        stream.end();
+      }
+    },
+  };
+
+  // Keep Pi's schema, structured output, rendering, session metadata, timeout and cancellation.
+  const bash = createBashToolDefinition(process.cwd(), { operations });
+  pi.registerTool({
+    ...bash,
+    description: `${bash.description}\n\nfnox secrets are available as environment variables; output is redacted.`,
+    async execute(id, params, signal, onUpdate, ctx) {
+      try {
+        const result = await bash.execute(id, params, signal, onUpdate, ctx);
+        return redact(result, true);
+      } catch (error) {
+        throw new Error(store.redactor.text(error instanceof Error ? error.message : "Bash execution failed."));
+      }
+    },
+  });
+
+  pi.on("user_bash", () => ({ operations }));
+  pi.on("tool_result", event => redact({
+    content: event.content, details: event.details, structuredContent: event.structuredContent,
+  }, event.toolName === "bash"));
+  pi.on("session_start", async (_event, ctx) => {
+    try { await store.reload(ctx.cwd); }
+    catch { ctx.ui.notify("fnox could not load secrets. Check fnox, then use /fnox-reload.", "warning"); }
+  });
+  pi.on("session_shutdown", () => store.clear());
+  pi.on("before_agent_start", event => {
+    const names = store.names();
+    if (!names.length) return;
+    return {
+      systemPrompt: `${event.systemPrompt}\n\n## fnox\nSecret environment variables: ${names.join(", ")}.\nUse $NAME in Bash; values are also available in process.env. Never print secrets or ask for their values. Exact known values are redacted from tool results.`,
+    };
+  });
+  pi.registerCommand("fnox-list", {
+    description: "List loaded fnox secret names (never values)",
+    handler: async (_args, ctx) => {
+      const names = store.names();
+      ctx.ui.notify(names.length ? names.join(", ") : "No fnox secrets loaded.", "info");
+    },
+  });
+  pi.registerCommand("fnox-reload", {
+    description: "Refresh fnox secrets atomically",
+    handler: async (_args, ctx) => {
+      try {
+        await store.reload(ctx.cwd);
+        ctx.ui.notify(`fnox: loaded ${store.names().length} secrets.`, "info");
+      } catch {
+        ctx.ui.notify("fnox refresh failed; previous secrets remain loaded. Check fnox configuration and daemon.", "warning");
+      }
+    },
+  });
 }
 
-const FNOX_CONFIG_PATH =
-	process.env.FNOX_CONFIG ??
-	`${process.env.HOME ?? "/root"}/.config/fnox/config.toml`;
-
-let cachedSecrets: SecretEntry[] | null = null;
-const activeProfile: string | undefined = process.env.FNOX_PROFILE || undefined;
-
-async function loadSecrets(profile: string | undefined): Promise<SecretEntry[]> {
-	return new Promise((resolve) => {
-		const args = [
-			"-c",
-			FNOX_CONFIG_PATH,
-			"export",
-			"-f",
-			"json",
-			"--no-daemon",
-		];
-		if (profile) args.push("-P", profile);
-
-		const proc = spawn("fnox", args, { stdio: ["ignore", "pipe", "pipe"] });
-		let out = "";
-		let err = "";
-
-		proc.stdout.on("data", (d: Buffer) => (out += d.toString()));
-		proc.stderr.on("data", (d: Buffer) => (err += d.toString()));
-
-		proc.on("error", (e) => {
-			console.error(`[pi-fnox] failed to spawn fnox: ${e.message}`);
-			resolve([]);
-		});
-
-		proc.on("close", (code) => {
-			if (code !== 0) {
-				console.error(
-					`[pi-fnox] fnox export failed (${code}): ${err.slice(0, 200)}`,
-				);
-				resolve([]);
-				return;
-			}
-			try {
-				const data = JSON.parse(out);
-				const secrets: SecretEntry[] = [];
-				for (const [name, value] of Object.entries(data.secrets ?? {})) {
-					if (value !== null && value !== undefined) {
-						secrets.push({ name, value: String(value) });
-					}
-				}
-				resolve(secrets);
-			} catch (e) {
-				console.error(`[pi-fnox] JSON parse failed: ${(e as Error).message}`);
-				resolve([]);
-			}
-		});
-	});
-}
-
-function injectIntoEnv(target: Record<string, string>, secrets: SecretEntry[]): void {
-	for (const s of secrets) {
-		target[s.name] = s.value;
-	}
-}
-
-function scrubOutput(text: string, secrets: SecretEntry[]): string {
-	if (secrets.length === 0) return text;
-	let result = text;
-	const sorted = [...secrets].sort((a, b) => b.value.length - a.value.length);
-	for (const s of sorted) {
-		if (s.value.length < 4) continue;
-		result = result.split(s.value).join(`[REDACTED:${s.name}]`);
-	}
-	return result;
-}
-
-export default function (pi: ExtensionAPI) {
-	const cwd = process.cwd();
-	const getSecrets = (): SecretEntry[] => cachedSecrets ?? [];
-
-	// Load at startup and inject into process.env.
-	// This is what makes runline plugins work in-process (they read process.env
-	// via applyEnvOverrides at connection-resolution time).
-	loadSecrets(activeProfile)
-		.then((secrets) => {
-			cachedSecrets = secrets;
-			injectIntoEnv(process.env as Record<string, string>, secrets);
-			console.error(
-				`[pi-fnox] loaded ${secrets.length} secrets from ${FNOX_CONFIG_PATH} (profile: ${activeProfile ?? "default"})`,
-			);
-		})
-		.catch((e: unknown) => {
-			console.error(`[pi-fnox] initial load failed: ${String(e)}`);
-		});
-
-	// Scrub secret values from all tool results
-	pi.on("tool_result", async (event) => {
-		const secrets = getSecrets();
-		if (secrets.length === 0) return;
-		const content = event.content as Array<{ type: string; text?: string }>;
-		const scrubbed = content.map((c) =>
-			c.type === "text" && typeof c.text === "string"
-				? { ...c, text: scrubOutput(c.text, secrets) }
-				: c,
-		);
-		return { content: scrubbed };
-	});
-
-	// Override built-in bash to inject secrets as env vars into spawned subprocesses
-	const baseBash = createBashTool(cwd);
-	pi.registerTool({
-		...baseBash,
-		description:
-			baseBash.description +
-			"\n\nSecrets from fnox vault are automatically injected as environment variables.",
-		async execute(id, params, signal, onUpdate, ctx) {
-			const secrets = getSecrets();
-			const wrapped = createBashTool(cwd, {
-				spawnHook: ({ command, cwd: spawnCwd, env }) => {
-					const injectedEnv: Record<string, string> = {
-						...(env ?? {}),
-						...process.env,
-					};
-					injectIntoEnv(injectedEnv, secrets);
-					return { command, cwd: spawnCwd, env: injectedEnv };
-				},
-			});
-			return wrapped.execute(id, params, signal, onUpdate, ctx);
-		},
-	});
-
-	// Inject secrets into user ! commands too
-	pi.on("user_bash", () => {
-		const localOps = createLocalBashOperations();
-		return {
-			operations: {
-				exec: async (command: string, execCwd: string, options: any) => {
-					const secrets = getSecrets();
-					const injectedEnv: Record<string, string> = {
-						...(options?.env ?? {}),
-						...process.env,
-					};
-					injectIntoEnv(injectedEnv, secrets);
-					return localOps.exec(command, execCwd, {
-						...options,
-						env: injectedEnv,
-					});
-				},
-			},
-		};
-	});
-
-	// Inject secret names into system prompt so the LLM knows what's available
-	pi.on("before_agent_start", async (event) => {
-		const secrets = getSecrets();
-		if (secrets.length === 0) return;
-		const names = secrets.map((s) => s.name).join(", ");
-		const profileNote = activeProfile ? ` (profile: ${activeProfile})` : "";
-		const instruction = [
-			"\n## fnox — Secret Management",
-			`Available secrets (injected as env vars in process.env + bash)${profileNote}: ${names}`,
-			"Use $SECRET_NAME in bash commands to reference secrets. Never ask the user for secret values.",
-			"Secret values are automatically scrubbed from command output.",
-		].join("\n");
-		return { systemPrompt: event.systemPrompt + instruction };
-	});
-
-	// /fnox-list — show available secret names (never values)
-	pi.registerCommand("fnox-list", {
-		description: "Show fnox secrets (names only)",
-		handler: async (_args, ctx) => {
-			const secrets = getSecrets();
-			if (secrets.length === 0) {
-				ctx.ui.notify("No fnox secrets loaded.", "info");
-				return;
-			}
-			const profileNote = activeProfile
-				? ` (profile: ${activeProfile})`
-				: "";
-			const list = secrets.map((s) => `  • ${s.name}`).join("\n");
-			ctx.ui.notify(`fnox secrets${profileNote}:\n${list}`, "info");
-			pi.sendMessage(
-				{
-					customType: "fnox-event",
-					content: `User listed fnox secrets${profileNote}: ${secrets.map((s) => s.name).join(", ")}.`,
-					display: true,
-				},
-				{ deliverAs: "nextTurn" },
-			);
-		},
-	});
-
-	// /fnox-reload — re-read fnox after fnox set/remove
-	pi.registerCommand("fnox-reload", {
-		description: "Reload fnox secrets from disk",
-		handler: async (_args, ctx) => {
-			cachedSecrets = null;
-			const secrets = await loadSecrets(activeProfile);
-			cachedSecrets = secrets;
-			injectIntoEnv(process.env as Record<string, string>, secrets);
-			ctx.ui.notify(`[pi-fnox] reloaded ${secrets.length} secrets`, "info");
-		},
-	});
+export default function (pi: ExtensionAPI): void {
+  install(pi, new SecretStore(process.env), createLocalBashOperations());
 }

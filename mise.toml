@@ -1,0 +1,19 @@
+[tools]
+node = "25.2.1"
+aube = "2.6.1"
+
+[tasks.setup]
+description = "Install development dependencies"
+run = "aube install --frozen-lockfile"
+
+[tasks.test]
+description = "Run tests without a real vault or network access"
+run = "aube run --no-install test"
+
+[tasks.check]
+description = "Strict TypeScript check"
+run = "aube run --no-install check"
+
+[tasks.ci]
+description = "Run all checks"
+depends = ["test", "check"]
